@@ -1,0 +1,601 @@
+---
+title: "Plasma Analysis"
+author: "Dinelka Nanayakkara"
+date: "2024-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+source("libraries.R")
+```
+
+
+## R Markdown
+
+```{r data_input}
+file_name <- "plasma_v2.csv"
+plasma <- df <- read.csv(file_name, header = FALSE)
+
+colnames <- c("age", "sex", "smokestat", "quetelet", "vituse", "calories", "fat", "fiber", "alcohol", "cholst", "betadt", "retdt", "betapl", "retpl")
+colnames(df) <- colnames
+
+df$id <- seq(1,nrow(df),by=1)
+
+str(df)
+summary(df)
+  # factors that req converting - sex, smokestat, vituse, alchol?
+  # alcohol of 203 is definitely an incorrect value.
+  # other than, there are values which indicate themselves as extreme/simply outliers, but these values are still plausible from a medical context.
+```
+
+```{r data_clean}
+factor_cols <- c("sex", "smokestat", "vituse") # variables that are categorical/factor variables.
+cont_cols <- colnames[!colnames %in% factor_cols] # variables that are continuous variables.
+df <- df %>% mutate_at(factor_cols, as.factor) 
+
+
+str(df)
+summary(df)
+
+df$sex <- recode_factor(df$sex, "1" = "Male", "2" = "Female")
+
+df <- subset(df, alcohol <= 50)     
+
+df$alc_cat <- factor(character(nrow(df)), levels = c("Infrequent", "Light", "Moderate", "Heavy"))
+
+
+  ### Categorizing continuous variables
+
+  # Alcohol Intake per week
+df <- df %>% mutate(alc_cat = ifelse(sex == "Male", case_when(alcohol == 0 ~ "Abstainer", alcohol <= 1 ~ "Infrequent", alcohol > 1 & alcohol <= 3 ~ "Light", alcohol >3 & alcohol <=14 ~ "Moderate", alcohol > 14 ~ "Heavy"),
+                                              case_when(alcohol == 0 ~ "Abstainer", alcohol <= 1 ~ "Infrequent", alcohol > 1 & alcohol <= 3 ~ "Light", alcohol >3 & alcohol <=7 ~ "Moderate", alcohol > 7 ~"Heavy")))
+
+  # Age
+
+df <- df %>% mutate(age_cat = ifelse(age < 65, "<65", ">=65"))
+
+
+```
+
+```{r collinearity}
+## using a Variance Inflation Factor (VIF)
+model <- lm(retpl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data = df)
+
+#create vector of VIF values
+vif_values <- as.data.frame(vif(model))
+vif_values$var <- rownames(vif_values)
+colnames(vif_values)[3] <- "vif"
+
+  ## * no concerning evidence that supports collinearity.
+vif <- ggplot(vif_values, aes(x = var, y = vif)) +
+  geom_bar(stat = "identity", color = "black", fill = "#6495ED") +
+  ggtitle("Variance Inflation Factor (VIF)") +
+  xlab("Predictor Variable") +
+  ylab("VIF") + 
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(family = "Arial"))
+
+ggsave("/nas/longleaf/home/dinelka/BIOS 992 - MS Project/figures/vif.png", plot=vif, width = 15, height = 6, units = "cm", dpi = 300)
+
+```
+
+
+```{r mlr_beta}
+
+fit_mlr_beta <- lm(betapl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df)
+summary(fit_mlr_beta)
+
+## checking for regression assumptions
+
+# Linearity - Component plus residual plot
+car::crPlots(fit_mlr_beta, terms = ~ age + quetelet + calories + fat + fiber + cholst + betadt + retdt,
+             pch=20, col="gray",
+             smooth = list(smoother=car::gamLine),
+             main = "Partial-Residual Plots (beta-carotene)",
+             ylab = "Partial Residual")
+
+
+
+# Close the graphics device and save the plot
+dev.off()
+
+# Homogeneity of Variance
+qqnorm(rstandard(fit_mlr_beta), col="red", pch=20); abline(a=0, b=1, col="blue", lty=2, lwd=2) # not normal - variable is skewed
+
+  ## try a log transformation
+  
+      ### remove if betapl is == 0
+df_log <- df[with(df, betapl != 0),]
+
+df_log$log_betapl <- log(df_log$betapl)
+fit_mlr_log_beta <- lm(log_betapl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df_log)
+
+qqnorm(rstandard(fit_mlr_log_beta), col="red", pch=20); abline(a=0, b=1, col="blue", lty=2, lwd=2) # much better fit, use log transformed.
+
+# Homogeneity of Variance
+
+car::residualPlots(fit_mlr_log_beta,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   ylab = "Residuals")
+
+
+# Linearity - Component plus residual plot (after doing a log transformation)
+car::crPlots(fit_mlr_log_beta, terms = ~ age + quetelet + calories + fat + fiber + cholst + betadt + retdt,
+             pch=20, col="gray",
+             smooth = list(smoother=car::gamLine),
+             main = "Partial-Residual Plots (beta-carotene)")
+
+
+  ### use a log transformed betapl variable going forward.
+ 
+## ----------- sensitivity analysis (identifying influential observations)
+
+leverage_mlr_beta <- hatvalues(fit_mlr_log_beta)
+cooks_mlr_beta <- cooks.distance(fit_mlr_log_beta)
+diagnostics <- data.frame(leverage_mlr_beta, cooks_mlr_beta)
+diagnostics$id <- seq(1,nrow(df_log))
+
+cooks <- ggplot(data = diagnostics, aes(x = seq_along(cooks_mlr_beta), y = cooks_mlr_beta)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Cook's Distance", x = "Observation Index", y = "Cook's Distance") +
+  geom_hline(yintercept = 4/(nrow(diagnostics) - length(fit_mlr_beta$coefficients)), color = "red", linetype = "dashed") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# leverage <- ggplot(data = diagnostics, aes(x = seq_along(leverage_mlr_beta), y = leverage_mlr_beta)) +
+#   geom_bar(stat = "identity", fill = "skyblue") +
+#   geom_hline(yintercept = 0.1, color = "red", linetype = "dashed") +
+#   labs(title = "Leverage Values", x = "Observation Index", y = "Leverage") +
+#   theme_minimal() +
+#   theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(filename = "/nas/longleaf/home/dinelka/BIOS 992 - MS Project/figures/cooks.png", plot = cooks)
+ggsave(filename = "/nas/longleaf/home/dinelka/BIOS 992 - MS Project/figures/leverage.png", plot = leverage)
+
+
+## subsetting extreme observations
+
+View(diagnostics[with(diagnostics, cooks_mlr_beta > 0.01),]$id)
+inf_cooks <- diagnostics[with(diagnostics, cooks_mlr_beta > 0.01),"id"]
+
+# after removing inf_points
+df_v2 <- subset(df_log, !id %in% inf_cooks) #df after removing outliers
+fit_mlr_log_beta_v2 <- lm(log_betapl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df_v2)
+summary(fit_mlr_log_beta_v2)
+
+### run regression diagnostics just to make sure
+car::crPlots(fit_mlr_log_beta_v2, terms = ~ age + quetelet + calories + fat + fiber + cholst + betadt + retdt,
+             pch=20, col="gray",
+             smooth = list(smoother=car::loessLine))
+
+qqnorm(rstandard(fit_mlr_log_beta_v2), col="red", pch=20); abline(a=0, b=1, col="blue", lty=2, lwd=2) # much better fit, use log transformed.
+
+car::residualPlots(fit_mlr_log_beta_v2,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F)
+
+```
+
+```{r mlr_ret}
+fit_mlr_ret <- lm(retpl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df)
+summary(fit_mlr_ret)
+
+## checking for regression assumptions
+
+# Linearity - Component plus residual plot
+car::crPlots(fit_mlr_ret, terms = ~ age + quetelet + calories + fat + fiber + cholst + betadt + retdt,
+             pch=20, col="gray",
+             smooth = list(smoother=car::gamLine),
+             main = "Partial-Residual Plots (retinol)",
+             ylab = "Partial Residual")
+
+
+# Normality of errors (residuals are observed)
+qqnorm(rstandard(fit_mlr_ret), col="red", pch=20); abline(a=0, b=1, col="blue", lty=2, lwd=2) # not normal - variable is skewed
+
+  ## try a log transformation
+  
+      ### remove if betapl is == 0
+df_log$log_retpl <- log(df_log$retpl)
+fit_mlr_log_ret <- lm(log_retpl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df_log)
+
+qqnorm(rstandard(fit_mlr_log_ret), col="red", pch=20); abline(a=0, b=1, col="blue", lty=2, lwd=2) # much better fit, use log transformed.
+shapiro.test(df_log$log_retpl)
+
+# Homogeneity of Variance
+car::residualPlots(fit_mlr_log_ret,
+                   pch=20, col="gray",
+                   fitted = T, terms = ~ 1,
+                   tests = F, quadratic = F,
+                   xlab = "Residuals") # no real pattern/trend therefore assumption is satisfied
+
+# Linearity (after a log-transformation)
+car::crPlots(fit_mlr_log_ret, terms = ~ age + quetelet + calories + fat + fiber + cholst + betadt + retdt,
+             pch=20, col="gray",
+             smooth = list(smoother=car::gamLine),
+             main = "Partial-Residual Plots (retinol)")
+
+
+## ---------------
+
+
+cooks_mlr_ret <- cooks.distance(fit_mlr_log_ret)
+diagnostics <- data.frame(cooks_mlr_ret)
+diagnostics$id <- seq(1,nrow(df_log))
+
+cooks <- ggplot(data = diagnostics, aes(x = seq_along(cooks_mlr_ret), y = cooks_mlr_ret)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Cook's Distance", x = "Observation Index", y = "Cook's Distance") +
+  geom_hline(yintercept = 4/(nrow(diagnostics) - length(fit_mlr_log_ret$coefficients)), color = "red", linetype = "dashed") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(filename = "/nas/longleaf/home/dinelka/BIOS 992 - MS Project/figures/cooks_ret.png", plot = cooks)
+
+## subsetting extreme observations
+
+View(diagnostics[with(diagnostics, cooks_mlr_ret > 0.01),]$id)
+inf_cooks <- diagnostics[with(diagnostics, cooks_mlr_ret > 0.01),"id"]
+
+# after removing inf_points
+df_v2 <- subset(df_log, !id %in% inf_cooks) #df after removing outliers
+fit_mlr_ret_v2 <- lm(log_retpl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data=df_v2)
+summary(fit_mlr_ret_v2)
+
+```
+
+
+```{r lasso_betapl - estimates}
+set.seed(123) # Ensure reproducibility
+
+df_transf <- model.matrix(~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data = df_v2)
+df_transf <- df_transf[,-1]
+
+#x <- as.matrix(df[, -which(names(df) %in% c("age_cat", "alc_cat", "betapl", "retpl"))])
+x <- df_transf
+y<- df_v2$log_betapl
+
+# Fit the Lasso model
+# Function to apply Lasso to each bootstrap sample
+lasso_boot <- function(data, indices){
+  
+  d <- data[indices,]  # select the bootstrap sample
+  fit <- glmnet(x = as.matrix(d[, -ncol(d)]), y = d[, ncol(d)], alpha = 1)
+  
+  cv_lasso <- cv.glmnet(x, y, alpha = 1, type.measure = "mse", nfolds = 10)
+  best_lambda <- cv_lasso$lambda.min
+  
+  coeffs <- predict(fit, s = best_lambda, type = "coefficients")
+  coeff_matrix <- as.matrix(coeffs[-1, , drop = FALSE])  # Exclude intercept
+  indicator = as.integer(coeff_matrix != 0)
+  
+  df_res[,paste0("V",j)] <<- indicator
+  df_coeff[,paste0("V",j)] <<- coeff_matrix
+  
+  print(j)
+  
+  #return(list(indicator = as.integer(coeff_matrix != 0), coefficients = coeff_matrix))
+
+}
+
+# bootstrap
+data <- data.frame(x, y) ; R <- 1e3
+df_res <- as.data.frame(matrix(0, nrow = 14, ncol = R)); df_coeff <- as.data.frame(matrix(0, nrow = 14, ncol = R))
+rownames(df_res) <- c("age", "sexFemale", "smokestat2", "smokestat3", "quetelet", "vituse2", "vituse3", "calories", "fat", "fiber", "alcohol", "cholst", "betadt", "retdt")
+
+for(j in 1:R){
+  boot(data = data, statistic = lasso_boot, R = 1)
+}
+
+# results
+est_lasso_bet <- data.frame(rownames(df_res)[which(rowMeans(df_res) > 0.8)], rowMeans(df_coeff)[which(rowMeans(df_res) > 0.8)], apply(df_coeff, 1, sd)[which(rowMeans(df_res) > 0.8)])
+
+```
+
+```{r lasso_retpl - estimates}
+set.seed(123) # Ensure reproducibility
+
+df_transf <- model.matrix(~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data = df_v2)
+df_transf <- df_transf[,-1]
+
+#x <- as.matrix(df[, -which(names(df) %in% c("age_cat", "alc_cat", "betapl", "retpl"))])
+x <- df_transf
+y<- df_v2$log_retpl
+
+# Fit the Lasso model
+# Function to apply Lasso to each bootstrap sample
+lasso_boot <- function(data, indices) {
+  d <- data[indices,]  # select the bootstrap sample
+  fit <- glmnet(x = as.matrix(d[, -ncol(d)]), y = d[, ncol(d)], alpha = 1)
+  
+  cv_lasso <- cv.glmnet(x, y, alpha = 1, type.measure = "mse", nfolds = 10)
+  best_lambda <- cv_lasso$lambda.min
+  
+  coeffs <- predict(fit, s = best_lambda, type = "coefficients")
+  coeff_matrix <- as.matrix(coeffs[-1, , drop = FALSE])  # Exclude intercept
+  indicator = as.integer(coeff_matrix != 0)
+  
+  df_res[,paste0("V",j)] <<- indicator
+  df_coeff[,paste0("V",j)] <<- coeff_matrix
+  
+  print(j)
+}
+
+# bootstrap
+data <- data.frame(x, y) ; R <- 1e3
+df_res <- as.data.frame(matrix(0, nrow = 14, ncol = R)); df_coeff <- as.data.frame(matrix(0, nrow = 14, ncol = R))
+rownames(df_res) <- c("age", "sexFemale", "smokestat2", "smokestat3", "quetelet", "vituse2", "vituse3", "calories", "fat", "fiber", "alcohol", "cholst", "betadt", "retdt")
+
+for(j in 1:R){
+  boot(data = data, statistic = lasso_boot, R = 1)
+}
+
+# results
+est_lasso_ret <- data.frame(rownames(df_res)[which(rowMeans(df_res) > 0.8)], rowMeans(df_coeff)[which(rowMeans(df_res) > 0.8)], apply(df_coeff, 1, sd)[which(rowMeans(df_res) > 0.8)])
+
+```
+
+
+
+# Prediction
+
+```{r data_split_mlr_lasso}
+# Set the seed for reproducibility
+set.seed(123)
+
+## -------- beta-carotene as the response variable
+
+# Create indices for training set (70% of the data)
+trainIndex_bet <- createDataPartition(df_v2$log_betapl, p = 0.7, list = FALSE, times = 1)
+
+# Get training data
+train_set_bet <- df_v2[trainIndex_bet, ]
+
+# Remaining data for validation and test splitting
+remaining_set_bet <- df_v2[-trainIndex_bet, ]
+
+# Create indices for validation set from the remaining data (2/3 of 30% ≈ 20% of total)
+validationIndex_bet <- createDataPartition(remaining_set_bet$log_betapl, p = 2/3, list = FALSE, times = 1)
+
+# Get validation and test sets
+validation_set_bet <- remaining_set_bet[validationIndex_bet, ]
+test_set_bet <- remaining_set_bet[-validationIndex_bet, ]
+
+
+## -------- retinol plasma as the response variable
+
+# Create indices for training set (70% of the data)
+trainIndex_ret <- createDataPartition(df_v2$log_retpl, p = 0.7, list = FALSE, times = 1)
+
+# Get training data
+train_set_ret <- df_v2[trainIndex_ret, ]
+
+# Remaining data for validation and test splitting
+remaining_set_ret <- df_v2[-trainIndex_ret, ]
+
+# Create indices for validation set from the remaining data (2/3 of 30% ≈ 20% of total)
+validationIndex_ret <- createDataPartition(remaining_set_ret$log_retpl, p = 2/3, list = FALSE, times = 1)
+
+# Get validation and test sets
+validation_set_ret <- remaining_set_ret[validationIndex_ret, ]
+test_set_ret <- remaining_set_ret[-validationIndex_ret, ]
+
+```
+
+```{r mlr_pred}
+
+  # beta-carotene
+mlr_pred_bet <- lm(log_betapl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data = train_set_bet)
+summary(mlr_pred_bet)
+pred_mlr_bet <- predict(mlr_pred, test_set_bet)
+mse_mlr_bet <- mean((pred_mlr_bet - test_set_bet$log_betapl)^2) #validation error
+cor(unname(pred_mlr_bet), test_set_bet$log_betapl)
+#cor(unname(predict(mlr_pred_bet, train_set_bet)), train_set_bet$log_betapl)
+
+  # retinol
+mlr_pred_ret <- lm(log_retpl ~ age + sex + smokestat + quetelet + vituse + calories + fat + fiber + alcohol + cholst + betadt + retdt, data = train_set_ret)
+summary(mlr_pred_ret)
+pred_mlr_ret <- predict(mlr_pred_ret, test_set_ret)
+mse_mlr_ret <- mean((pred_mlr_ret - test_set_ret$log_retpl)^2) #validation error
+cor(unname(pred_mlr_ret), test_set_ret$log_retpl)
+#cor(unname(predict(mlr_pred_ret, train_set_ret)), train_set_ret$log_retpl)
+
+```
+
+```{r lasso_pred}
+set.seed(123) # Ensure reproducibility
+
+  ### ---- predict beta-carotene plasma
+
+#x_train <- as.matrix(train_set_bet[, -which(names(train_set_bet) %in% c("age_cat" ,"alc_cat", "betapl", "retpl", "id", "log_retpl"))])
+x_train <- df_transf[which(rownames(df_transf) %in% rownames(train_set_bet)),]
+y_train_bet <- train_set_bet$log_betapl
+
+x_valid <- df_transf[which(rownames(df_transf) %in% rownames(validation_set_bet)),]
+y_valid_bet <- validation_set_bet$log_betapl
+
+x_test <- df_transf[which(rownames(df_transf) %in% rownames(test_set_bet)),]
+y_test_bet <- test_set_bet$log_betapl
+
+# Fit the Lasso model
+lasso_bet <- glmnet(x_train, y_train_bet, alpha = 1) # alpha=1 indicates Lasso; alpha=0 would be Ridge
+
+cv_lasso <- cv.glmnet(x_train, y_train_bet, alpha = 1, type.measure = "mse", nfolds = 10)
+#plot(cv_lasso)
+
+# Use the lambda that gives minimum mean squared error
+best_lambda_bet <- cv_lasso$lambda.min
+
+predictions_valid_bet <- predict(lasso_bet, s = best_lambda_bet, newx = x_valid)
+mse_valid_lasso_bet <- mean((predictions_valid_bet - y_valid_bet)^2)
+#print(paste("Validation MSE:", mse_valid))
+cor(as.data.frame(predictions_valid_bet)$s1, validation_set_bet$log_betapl)
+
+  # test MSE
+predictions_test_bet <- predict(lasso_bet, s = best_lambda_bet, newx = x_test)
+mse_test_lasso_bet <- mean((predictions_test_bet - y_test_bet)^2)
+#print(paste("Validation MSE:", mse_valid))
+cor(as.data.frame(predictions_test_bet)$s1, test_set_bet$log_betapl)
+
+
+ ### ---- predict retinol plasma concentration
+y_train_ret <- train_set_bet$log_retpl
+y_valid_ret <- validation_set_bet$log_retpl
+y_test_ret <- test_set_bet$log_retpl
+
+# Fit the Lasso model
+lasso_ret <- glmnet(x_train, y_train_ret, alpha = 1) # alpha=1 indicates Lasso; alpha=0 would be Ridge
+
+cv_lasso <- cv.glmnet(x_train, y_train_ret, alpha = 1, type.measure = "mse", nfolds = 20)
+#plot(cv_lasso)
+
+# Use the lambda that gives minimum mean squared error
+best_lambda_ret <- cv_lasso$lambda.min
+
+predictions_valid_ret <- predict(lasso_ret, s = best_lambda_ret, newx = x_valid)
+mse_valid_lasso_ret <- mean((predictions_valid_ret - y_valid_ret)^2)
+#print(paste("Validation MSE:", mse_valid))
+cor(as.data.frame(predictions_valid_ret)$s1, validation_set_ret$log_retpl)
+
+# test MSE
+predictions_test_ret <- predict(lasso_ret, s = best_lambda_ret, newx = x_test)
+mse_test_lasso_ret <- mean((predictions_test_ret - y_test_ret)^2)
+cor(as.data.frame(predictions_test_ret)$s1, test_set_ret$log_retpl)
+
+
+```
+
+
+```{r data_split_rf}
+# Set the seed for reproducibility
+set.seed(123)
+
+## -------- beta-carotene as the response variable
+
+# Create indices for training set (70% of the data)
+trainIndex_bet <- createDataPartition(df_log$log_betapl, p = 0.7, list = FALSE, times = 1)
+
+# Get training data
+train_set_bet <- df_log[trainIndex_bet, ]
+
+# Remaining data for validation and test splitting
+remaining_set_bet <- df_log[-trainIndex_bet, ]
+
+# Create indices for validation set from the remaining data (2/3 of 30% ≈ 20% of total)
+validationIndex_bet <- createDataPartition(remaining_set_bet$log_betapl, p = 2/3, list = FALSE, times = 1)
+
+# Get validation and test sets
+validation_set_bet <- remaining_set_bet[validationIndex_bet, ]
+test_set_bet <- remaining_set_bet[-validationIndex_bet, ]
+
+
+## -------- retinol plasma as the response variable
+
+# Create indices for training set (70% of the data)
+trainIndex_ret <- createDataPartition(df_log$log_retpl, p = 0.7, list = FALSE, times = 1)
+
+# Get training data
+train_set_ret <- df_log[trainIndex_ret, ]
+
+# Remaining data for validation and test splitting
+remaining_set_ret <- df_log[-trainIndex_ret, ]
+
+# Create indices for validation set from the remaining data (2/3 of 30% ≈ 20% of total)
+validationIndex_ret <- createDataPartition(remaining_set_ret$log_retpl, p = 2/3, list = FALSE, times = 1)
+
+# Get validation and test sets
+validation_set_ret <- remaining_set_ret[validationIndex_ret, ]
+test_set_ret <- remaining_set_ret[-validationIndex_ret, ]
+
+```
+
+```{r rf_pred}
+set.seed(123)
+
+### Beta-carotene
+
+# Define training control
+train_control <- trainControl(method = "cv", number = 10)
+
+  ## tune the model
+ntree_range <- seq(100,1000, by = 50)
+mtry_range <- seq(2,14,by=1)
+results_rf_ret <- expand.grid(ntree = ntree_range, mtry = mtry_range, RMSE = NA)
+index <- 1
+
+for (ntree in ntree_range) {
+    for (mtry in mtry_range) {
+        rf_model <- randomForest(x = x_train, y = y_train_bet, ntree = ntree, mtry = mtry)
+        predictions <- predict(rf_model, x_valid)
+        results_rf_ret$RMSE[index] <- sqrt(mean((y_valid_bet - predictions)^2))
+        index <- index + 1
+    }
+}
+
+best_settings_rf_bet <- results_rf_ret[which.min(results_rf_ret$RMSE), ]
+print(best_settings_rf_bet)
+
+
+
+  # retinol
+
+# Define training control
+train_control <- trainControl(method = "cv", number = 10)
+
+  ## tune the model
+ntree_range <- seq(100,1000, by = 50)
+mtry_range <- seq(2,14,by=1)
+results_rf_bet <- expand.grid(ntree = ntree_range, mtry = mtry_range, RMSE = NA)
+index <- 1
+
+for (ntree in ntree_range) {
+    for (mtry in mtry_range) {
+        rf_model <- randomForest(x = x_train, y = y_train_ret, ntree = ntree, mtry = mtry)
+        predictions <- predict(rf_model, x_valid)
+        results_rf_bet$RMSE[index] <- sqrt(mean((y_valid_ret - predictions)^2))
+        index <- index + 1
+    }
+}
+
+best_settings_rf_ret <- results[which.min(results$RMSE), ]
+print(best_settings_rf_ret)
+
+
+## beta - ntree 200, mtry 4
+## ret  - ntree 200, mtry 2
+
+
+  ### ---- run again with this combo of parameters
+
+# beta-carotene
+rf_model <- randomForest(x = x_train, y = y_train_bet, ntree = 550, mtry = 2)
+predictions <- predict(rf_model, x_test)
+mse_rf_bet <- mean((y_test_bet - predictions)^2)
+cor(unname(predictions), test_set_bet$log_betapl)
+
+# retinol
+rf_model <- randomForest(x = x_train, y = y_train_ret, ntree = 200, mtry = 2)
+predictions <- predict(rf_model, x_test)
+mse_rf_ret <- mean((y_test_ret - predictions)^2)
+cor(predictions, test_set_ret$log_retpl)
+
+````
+
+
+
+
+
+
+
+
+
+
+
+
+
+
